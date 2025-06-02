@@ -197,6 +197,18 @@ public class SalesforceStreamData extends GenericPollingConsumer implements Conn
      * @throws Throwable
      */
     private void makeConnect() throws Throwable {
+        // Check if an active connection already exists
+        if (this.connector != null && this.connector.isConnected()) {
+            LOG.info("Salesforce connector is already connected and active. Skipping new connection setup.");
+            return;
+        }
+
+        // If a connector exists but is not connected, stop it to clean up resources
+        if (this.connector != null) {
+            LOG.info("Stopping existing (but not connected) Salesforce connector before creating a new one.");
+            this.connector.stop();
+        }
+
         Consumer<Map<String, Object>> consumer = event -> injectSalesforceMessage(JSON.toString(event),
                 (Long) ((HashMap) event.
                         get(SalesforceConstant.EVENT)).get(SalesforceConstant.REPLAY_ID));
@@ -209,15 +221,15 @@ public class SalesforceStreamData extends GenericPollingConsumer implements Conn
             }
         });
         BayeuxParameters params = tokenProvider.login();
+        // connector object is created now after initial checks.
         connector = new EmpConnector(params, this);
         LoggingListener loggingListener = new LoggingListener(true, true);
         connector.addListener(Channel.META_HANDSHAKE, loggingListener).addListener(Channel.META_CONNECT, loggingListener)
                 .addListener(Channel.META_DISCONNECT, loggingListener).addListener(Channel.META_SUBSCRIBE, loggingListener)
                 .addListener(Channel.META_UNSUBSCRIBE, loggingListener);
         connector.setBearerTokenProvider(tokenProvider);
-        if (connector.isConnected()) {
-            connector.stop();
-        }
+        // Removed redundant connector.isConnected() check and stop() call here as it's handled above
+        // and a new connector is always created if we reach this point.
         connector.start().get(waitTime, TimeUnit.MILLISECONDS);
         TopicSubscription subscription;
 
@@ -350,15 +362,26 @@ public class SalesforceStreamData extends GenericPollingConsumer implements Conn
      * @return
      */
     public Object poll() {
-        //Establishing connection with Salesforce streaming api.
+        LOG.info("Salesforce Inbound Endpoint '" + name + "' : Poll cycle initiated. isPolled: " + isPolled +
+                ", connectionFailed: " + connectionFailed);
         try {
+            LOG.debug("Salesforce Inbound Endpoint '" + name + "' : Checking connection status. isPolled: " + isPolled +
+                    ", connectionFailed: " + connectionFailed);
             if (!isPolled || connectionFailed) {
+                LOG.info("Salesforce Inbound Endpoint '" + name + "' : Conditions met to call makeConnect(). isPolled: "
+                        + isPolled + ", connectionFailed: " + connectionFailed);
                 makeConnect();
-                isPolled = true;
+                // Only set connectionFailed to false if makeConnect() was successful.
+                // If makeConnect() itself throws an error, the catch block will handle setting connectionFailed = true.
                 connectionFailed = false;
+                isPolled = true;
+                LOG.info("Salesforce Inbound Endpoint '" + name + "' : makeConnect() attempt finished. isPolled: " + isPolled +
+                        ", connectionFailed: " + connectionFailed);
             }
         } catch (Throwable e) {
-            LOG.error("Error while setup the Salesforce connection.", e);
+            LOG.error("Salesforce Inbound Endpoint '" + name + "' : Error during poll cycle or makeConnect(). Error: " + e.getMessage(), e);
+            connectionFailed = true;
+            LOG.info("Salesforce Inbound Endpoint '" + name + "' : Set connectionFailed to true due to error.");
         }
         return null;
     }
@@ -371,15 +394,27 @@ public class SalesforceStreamData extends GenericPollingConsumer implements Conn
     private void injectSalesforceMessage(String message, long id) {
         if (injectingSeq != null) {
             if (LOG.isDebugEnabled()) {
-                LOG.info("id for the event received: " + id);
+                // Retaining this log for visibility of received event ID before processing
+                LOG.info("Salesforce Inbound Endpoint '" + name + "' : Received event with ID: " + id + ". Preparing for injection.");
+            }
+            // Call injectMessage first. If it fails, updateRegistryEventID will not be called.
+            injectMessage(message, SalesforceConstant.CONTENT_TYPE);
+
+            // If injectMessage was successful, then update the registry.
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Salesforce Inbound Endpoint '" + name + "' : Message injected successfully into sequence: " + injectingSeq +
+                          ". Attempting to update registry with event ID: " + id);
             }
             updateRegistryEventID(id);
-            injectMessage(message, SalesforceConstant.CONTENT_TYPE);
             if (LOG.isDebugEnabled()) {
-                LOG.debug("injecting salesforce message to the sequence : " + injectingSeq);
+                // This log confirms that updateRegistryEventID was called.
+                LOG.debug("Salesforce Inbound Endpoint '" + name + "' : Registry update call completed for event ID: " + id);
             }
         } else {
-            handleException("the Sequence is not found");
+            // It's important that handleException throws a runtime exception to halt processing if the sequence is null.
+            // Otherwise, if it just logs, we might proceed as if successful.
+            LOG.error("Salesforce Inbound Endpoint '" + name + "' : Injecting sequence is null. Cannot process event ID: " + id);
+            handleException("The injecting sequence (injectingSeq) is not configured for Salesforce Inbound Endpoint '" + name + "'.");
         }
     }
 
@@ -398,13 +433,22 @@ public class SalesforceStreamData extends GenericPollingConsumer implements Conn
      */
     @Override
     public void destroy() {
-        if (connector != null) {
-            connector.stop();
+        if (this.connector != null) {
+            LOG.info("Salesforce Inbound Endpoint '" + name + "' : Connector stop requested.");
+            this.connector.stop();
+            LOG.info("Salesforce Inbound Endpoint '" + name + "' : Connector stopped.");
+            this.connector = null;
         }
     }
 
     @Override
     public void resume() {
+        LOG.info("Salesforce Inbound Endpoint '" + name + "' : Resuming...");
+        if (this.connector != null) {
+            LOG.info("Salesforce Inbound Endpoint '" + name + "' : Attempting to stop existing connector during resume.");
+            this.connector.stop();
+            this.connector = null; // Ensure a fresh connector is created
+        }
         isPolled = false;
         isInitialEventIdUsed = false;
     }
